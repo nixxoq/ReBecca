@@ -77,12 +77,13 @@ fn main() -> io::Result<()> {
     }
 
     println!("\nSaving changes");
-    hive.save_to_file("SYSTEM_mod")?;
+
+    // hive.commit().expect("Failed to commit changes");
+    hive.save_to("SYSTEM_mod")?;
     println!("Saved hive to SYSTEM_mod");
     //
     println!("\nVerifying");
     let hive = RegHive::from("SYSTEM_mod")?;
-
     if let Some(key) = hive.find_key("Setup")
         && let Some(value) = key.values.iter().find(|v| v.name == "CmdLine")
         && let Some(current) = value.as_string()

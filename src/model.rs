@@ -1,5 +1,8 @@
+use std::path::PathBuf;
+
 #[derive(Debug)]
 pub struct RegHive {
+    pub path: Option<PathBuf>,
     pub base_block: RegHeader,
     pub root_key: Option<RegKey>,
     pub(crate) raw_data: Vec<u8>,

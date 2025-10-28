@@ -1,25 +1,26 @@
-use crate::model::RegValueLoc;
 use crate::{
     constants::{
         INLINE_DATA_FLAG, MAX_OFFSET, MIN_REG_SIZE, REG_HEAD_OFFSET, SIGNATURE_LEAF,
         SIGNATURE_LEAF_HASH_1, SIGNATURE_LEAF_HASH_2, SIGNATURE_ROOT_INDEX,
     },
-    model::{RegHeader, RegHive, RegKey, RegValue, RegValueType},
+    model::{RegHeader, RegHive, RegKey, RegValue, RegValueLoc, RegValueType},
 };
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::{
-    fs::File,
-    io::{self, Read},
-    path::Path,
+    fs::{File, OpenOptions},
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
 };
 
 impl RegHive {
     pub fn from<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let mut file = File::open(path)?;
+        let mut file = File::open(path.as_ref())?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
-        Self::parse(&data)
+
+        let mut hive = Self::parse(&data)?;
+        hive.path = Some(path.as_ref().to_path_buf());
+
+        Ok(hive)
     }
 
     pub fn parse(data: &[u8]) -> io::Result<Self> {
@@ -43,6 +44,7 @@ impl RegHive {
             base_block,
             root_key,
             raw_data: data.to_vec(),
+            path: None,
         })
     }
 
@@ -496,8 +498,7 @@ impl RegHive {
         self.raw_data[12..16].copy_from_slice(&self.base_block.hive_bins_data_size.to_le_bytes());
 
         if cell_size < size_needed + 4 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "Failed to allocate enough space even after expansion",
             ));
         }
@@ -831,7 +832,7 @@ impl RegHive {
         Ok(())
     }
 
-    pub fn save_to_file<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
+    fn rebuild_sequence(&mut self) {
         self.base_block.sequence1 = self.base_block.sequence1.wrapping_add(1);
         self.base_block.sequence2 = self.base_block.sequence1;
 
@@ -841,17 +842,53 @@ impl RegHive {
         // checksum
         let mut checksum: u32 = 0;
         for chunk in self.raw_data[0..508].chunks_exact(4) {
-            checksum ^= u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            checksum ^= u32::from_le_bytes(chunk.try_into().unwrap());
         }
         self.raw_data[508..512].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    pub fn commit(&mut self) -> io::Result<()> {
+        // quite simple
+        // path -> temp_file -> renaming -> done
+        let path = self.path.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Path to hive was not found. Use save_to() first.",
+            )
+        })?;
+
+        self.rebuild_sequence();
+
+        let mut temp_file = path.as_os_str().to_owned();
+        temp_file.push(".tmp");
+        let temp_path = PathBuf::from(temp_file);
+
+        {
+            let mut temp_file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .create(true)
+                .open(&temp_path)?;
+
+            temp_file.write_all(&self.raw_data)?;
+            temp_file.sync_all()?;
+        }
+
+        std::fs::rename(&temp_path, &path)?;
+        Ok(())
+    }
+
+    pub fn save_to<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
+        self.rebuild_sequence();
 
         let mut file = OpenOptions::new()
             .write(true)
             .truncate(true)
             .create(true)
-            .open(path)?;
+            .open(path.as_ref())?;
         file.write_all(&self.raw_data)?;
         file.sync_all()?;
+        self.path = Some(path.as_ref().to_path_buf());
 
         Ok(())
     }
