@@ -5,7 +5,7 @@ use crate::{
         SIGNATURE_LEAF_HASH_2, SIGNATURE_ROOT_INDEX,
     },
     model::{RegHeader, RegHive, RegKey, RegKeyLoc, RegValue, RegValueLoc, RegValueType},
-    registry::allocator::{self, read_value_data},
+    registry::allocator::{self, create_empty_hive, read_value_data},
 };
 use std::{
     fs::{File, OpenOptions},
@@ -32,7 +32,7 @@ impl RegHive {
 
     /// Creates a completely new, valid empty Windows REGF registry hive with a custom root key name.
     pub fn new_empty_with_name(root_name: &str) -> io::Result<Self> {
-        let (_base_block, raw_data) = allocator::create_empty_hive(root_name)?;
+        let (_base_block, raw_data) = create_empty_hive(root_name)?;
         Self::parse(&raw_data)
     }
 
