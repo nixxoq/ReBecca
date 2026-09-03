@@ -6,7 +6,7 @@ use crate::model::{RegHive, RegValueType};
 use std::io::{self};
 
 fn main() -> io::Result<()> {
-    let mut hive = RegHive::from("SYSTEM_c")?;
+    let mut hive = RegHive::from("SYSTEM_orig")?;
 
     println!("Base Block:");
     println!(
@@ -71,10 +71,23 @@ fn main() -> io::Result<()> {
         }
     }
 
-    match hive.update_string_value("Setup", "CmdLine", "cmd.exe") {
+    // match hive.update_string_value("Setup", "CmdLine", "cmd.exe") {
+    match hive.update_string_value(
+        "Setup",
+        "CmdLine",
+        "THIS_IS_A_TEST_STRING_THAT_MUST_BE_LONGER_THAN_THE_EXISTING_REGISTRY_CELL_\
+         0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+    ) {
         Ok(_) => println!("✓ Updated CmdLine"),
         Err(e) => println!("✗ Failed to update: {}", e),
     }
+
+    println!("\nCreating key path and values (Software\\MyApp\\Config):");
+    hive.create_key("Software\\MyApp\\Config")?;
+    hive.set_string("Software\\MyApp\\Config", "Name", "Example")?;
+    hive.set_dword("Software\\MyApp\\Config", "Enabled", 1)?;
+    hive.set_binary("Software\\MyApp\\Config", "Blob", &[0xDE, 0xAD, 0xBE, 0xEF])?;
+    println!("✓ Created Software\\MyApp\\Config with Name, Enabled, and Blob");
 
     println!("\nSaving changes");
 
@@ -100,6 +113,26 @@ fn main() -> io::Result<()> {
     {
         println!("Setup\\SystemSetupInProgress = {}", current);
     }
+
+    if let Some(key) = hive.find_key("Software\\MyApp\\Config") {
+        println!("\nSoftware\\MyApp\\Config values:");
+        for v in &key.values {
+            match &v.value_type {
+                RegValueType::String => println!("  {} = \"{}\"", v.name, v.as_string().unwrap()),
+                RegValueType::Dword => println!("  {} = {}", v.name, v.as_dword().unwrap()),
+                RegValueType::Binary => println!("  {} = {:02X?}", v.name, v.data),
+                _ => println!("  {} = {:?}", v.name, v.value_type),
+            }
+        }
+    }
+
+    println!("\nCreating brand-new empty hive from scratch:");
+    let mut new_hive = RegHive::new_empty()?;
+    new_hive.create_key("Software\\MyApp\\Config")?;
+    new_hive.set_string("Software\\MyApp\\Config", "Name", "ReBecca")?;
+    new_hive.set_dword("Software\\MyApp\\Config", "Enabled", 1)?;
+    new_hive.save_to("my_hive")?;
+    println!("✓ Saved brand-new hive with keys and values to 'my_hive'");
 
     Ok(())
 }

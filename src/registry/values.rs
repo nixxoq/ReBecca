@@ -9,8 +9,10 @@ impl RegValue {
                 if self.data.len() >= 2 {
                     let u16_data: Vec<u16> = self
                         .data
-                        .chunks_exact(2)
-                        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|chunk| u16::from_le_bytes(*chunk))
                         .take_while(|&c| c != 0)
                         .collect();
 
@@ -63,6 +65,37 @@ impl RegValue {
         }
     }
 
+    /// Convert REG_MULTI_SZ value to Vec<String>
+    pub fn as_multi_string(&self) -> Option<Vec<String>> {
+        if matches!(self.value_type, RegValueType::MultiString) {
+            let u16_chars: Vec<u16> = self
+                .data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
+                .collect();
+            let mut result = Vec::new();
+            let mut current = Vec::new();
+            for c in u16_chars {
+                if c == 0 {
+                    if !current.is_empty() {
+                        result.push(String::from_utf16_lossy(&current));
+                        current.clear();
+                    }
+                } else {
+                    current.push(c);
+                }
+            }
+            if !current.is_empty() {
+                result.push(String::from_utf16_lossy(&current));
+            }
+            Some(result)
+        } else {
+            None
+        }
+    }
+
     pub fn as_binary(&self) -> &[u8] {
         &self.data
     }
@@ -74,5 +107,13 @@ impl RegValue {
                 loc.cell_offset, loc.data_offset, loc.data_size, loc.inline
             )
         })
+    }
+
+    pub fn is_inline(&self) -> Option<bool> {
+        self.location.as_ref().map(|loc| loc.inline)
+    }
+
+    pub fn data_offset(&self) -> Option<usize> {
+        self.location.as_ref().map(|loc| loc.data_offset)
     }
 }

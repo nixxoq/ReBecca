@@ -1,9 +1,11 @@
 use crate::{
     constants::{
-        INLINE_DATA_FLAG, MAX_OFFSET, MIN_REG_SIZE, REG_HEAD_OFFSET, SIGNATURE_LEAF,
-        SIGNATURE_LEAF_HASH_1, SIGNATURE_LEAF_HASH_2, SIGNATURE_ROOT_INDEX,
+        BIG_DATA_THRESHOLD, DEFAULT_ROOT_KEY_NAME, INLINE_DATA_FLAG, MAX_OFFSET, MIN_REG_SIZE,
+        REG_HEAD_OFFSET, SIGNATURE_BIG_DATA, SIGNATURE_LEAF, SIGNATURE_LEAF_HASH_1,
+        SIGNATURE_LEAF_HASH_2, SIGNATURE_ROOT_INDEX,
     },
-    model::{RegHeader, RegHive, RegKey, RegValue, RegValueLoc, RegValueType},
+    model::{RegHeader, RegHive, RegKey, RegKeyLoc, RegValue, RegValueLoc, RegValueType},
+    registry::allocator::{self, read_value_data},
 };
 use std::{
     fs::{File, OpenOptions},
@@ -21,6 +23,21 @@ impl RegHive {
         hive.path = Some(path.as_ref().to_path_buf());
 
         Ok(hive)
+    }
+
+    /// Creates a completely new, valid empty Windows REGF registry hive with the default root name ("ROOT").
+    pub fn new_empty() -> io::Result<Self> {
+        Self::new_empty_with_name(DEFAULT_ROOT_KEY_NAME)
+    }
+
+    /// Creates a completely new, valid empty Windows REGF registry hive with a custom root key name.
+    pub fn new_empty_with_name(root_name: &str) -> io::Result<Self> {
+        let (_base_block, raw_data) = allocator::create_empty_hive(root_name)?;
+        Self::parse(&raw_data)
+    }
+
+    pub fn root_key(&self) -> Option<&RegKey> {
+        self.root_key.as_ref()
     }
 
     pub fn parse(data: &[u8]) -> io::Result<Self> {
@@ -105,8 +122,20 @@ impl RegHive {
             cell_data[11],
         ]);
 
+        let flags = u16::from_le_bytes([cell_data[2], cell_data[3]]);
+        let parent_offset = u32::from_le_bytes([
+            cell_data[0x10],
+            cell_data[0x11],
+            cell_data[0x12],
+            cell_data[0x13],
+        ]);
         let (subkeys_count, subkeys_offset) = (
-            u32::from_le_bytes([cell_data[14], cell_data[15], cell_data[16], cell_data[17]]),
+            u32::from_le_bytes([
+                cell_data[0x14],
+                cell_data[0x15],
+                cell_data[0x16],
+                cell_data[0x17],
+            ]),
             u32::from_le_bytes([
                 cell_data[0x1C],
                 cell_data[0x1D],
@@ -130,9 +159,34 @@ impl RegHive {
             ]),
         );
 
+        let security_offset = u32::from_le_bytes([
+            cell_data[0x2C],
+            cell_data[0x2D],
+            cell_data[0x2E],
+            cell_data[0x2F],
+        ]);
+
+        let class_offset = u32::from_le_bytes([
+            cell_data[0x30],
+            cell_data[0x31],
+            cell_data[0x32],
+            cell_data[0x33],
+        ]);
+
         let name_length = u16::from_le_bytes([cell_data[0x48], cell_data[0x49]]) as usize;
         let name = if name_length > 0 && cell_data.len() >= 0x4C + name_length {
-            String::from_utf8_lossy(&cell_data[0x4C..0x4C + name_length]).to_string()
+            let name_bytes = &cell_data[0x4C..0x4C + name_length];
+            if (flags & 0x0020) != 0 {
+                String::from_utf8_lossy(name_bytes).to_string()
+            } else {
+                let utf16: Vec<u16> = name_bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes(*c))
+                    .collect();
+                String::from_utf16_lossy(&utf16)
+            }
         } else {
             String::new()
         };
@@ -168,6 +222,17 @@ impl RegHive {
             Vec::new()
         };
 
+        let location = Some(RegKeyLoc {
+            cell_offset: offset,
+            cell_size,
+            parent_offset,
+            subkeys_offset,
+            values_offset,
+            security_offset,
+            class_offset,
+            flags,
+        });
+
         Ok(RegKey {
             name,
             last_written,
@@ -176,6 +241,7 @@ impl RegHive {
             subkeys,
             values,
             class_name: None,
+            location,
         })
     }
 
@@ -358,18 +424,7 @@ impl RegHive {
             (offset_b.get(..size).unwrap_or_default().to_vec(), loc)
         } else if data_offset > 0 && data_offset != MAX_OFFSET {
             let real_offset = REG_HEAD_OFFSET + data_offset as usize;
-
-            let result = {
-                let data_cell = data.get(real_offset..real_offset + 4).unwrap_or_default();
-                let data_cell_s = i32::from_le_bytes(data_cell.try_into().ok().unwrap_or_default())
-                    .unsigned_abs() as usize;
-
-                let offset_start = real_offset + 4;
-                let data_end = (offset_start + data_size as usize).min(real_offset + data_cell_s);
-
-                let data = data.get(offset_start..data_end).unwrap_or_default();
-                Some(data.to_vec())
-            };
+            let result = read_value_data(data, data_size, data_offset)?;
 
             let loc = if track_loc {
                 Some(RegValueLoc {
@@ -382,7 +437,7 @@ impl RegHive {
                 None
             };
 
-            (result.unwrap_or_default(), loc)
+            (result, loc)
         } else {
             (Vec::new(), None)
         };
@@ -398,124 +453,512 @@ impl RegHive {
     pub fn find_key(&self, path: &str) -> Option<&RegKey> {
         let root = self.root_key.as_ref()?;
         let parts: Vec<&str> = path.split('\\').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return Some(root);
+        }
+        let parts_slice = if parts[0].eq_ignore_ascii_case(&root.name) {
+            &parts[1..]
+        } else {
+            &parts[..]
+        };
 
-        parts.iter().try_fold(root, |root, &part| {
-            root.subkeys
+        parts_slice.iter().try_fold(root, |key, &part| {
+            key.subkeys
                 .iter()
                 .find(|subkey| subkey.name.eq_ignore_ascii_case(part))
         })
     }
 
-    fn find_key_mut(&mut self, key_path: &str) -> Option<&mut RegKey> {
+    pub fn find_key_mut(&mut self, key_path: &str) -> Option<&mut RegKey> {
         let parts: Vec<&str> = key_path.split('\\').filter(|s| !s.is_empty()).collect();
-        let mut current_key = self.root_key.as_mut()?;
+        let current_key = self.root_key.as_mut()?;
+        if parts.is_empty() {
+            return Some(current_key);
+        }
 
-        for part in parts {
-            current_key = current_key
+        let skip_root = parts[0].eq_ignore_ascii_case(&current_key.name);
+        let mut key = current_key;
+        let iter = if skip_root { &parts[1..] } else { &parts[..] };
+
+        for part in iter {
+            key = key
                 .subkeys
                 .iter_mut()
                 .find(|sk| sk.name.eq_ignore_ascii_case(part))?;
         }
-        Some(current_key)
+        Some(key)
     }
 
-    fn find_space(&self, size_needed: usize) -> Option<u32> {
-        let aligned_size = (size_needed + 4 + 7) & !7;
-        let mut current_offset = REG_HEAD_OFFSET;
+    pub fn create_child_key(&mut self, parent_path: &str, child_name: &str) -> io::Result<()> {
+        let child_name = child_name.trim();
+        if child_name.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Child key name cannot be empty",
+            ));
+        }
+        if child_name.contains('\\') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Child key name cannot contain backslashes",
+            ));
+        }
+        if child_name.chars().count() > 255 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Key name exceeds 255 characters",
+            ));
+        }
 
-        while current_offset < self.raw_data.len() {
-            if current_offset + 4 > self.raw_data.len() {
-                break;
+        let parent = self.find_key(parent_path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Parent key '{}' not found", parent_path),
+            )
+        })?;
+
+        if parent
+            .subkeys
+            .iter()
+            .any(|k| k.name.eq_ignore_ascii_case(child_name))
+        {
+            return Ok(());
+        }
+
+        let parent_loc = parent.location.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Parent key location not tracked",
+            )
+        })?;
+
+        let parent_rel = (parent_loc.cell_offset - REG_HEAD_OFFSET) as u32;
+        let security_rel = parent_loc.security_offset;
+
+        let (child_rel, child_size) = allocator::create_key_node(
+            &mut self.raw_data,
+            &mut self.base_block,
+            parent_rel,
+            child_name,
+            security_rel,
+        )?;
+
+        let new_subkeys_off = match allocator::add_subkey_to_parent(
+            &mut self.raw_data,
+            &mut self.base_block,
+            parent_rel,
+            child_rel,
+            child_name,
+        ) {
+            Ok(off) => off,
+            Err(e) => {
+                allocator::free_cell(
+                    &mut self.raw_data,
+                    child_rel,
+                    self.base_block.hive_bins_data_size,
+                );
+                return Err(e);
+            }
+        };
+
+        let child_loc = RegKeyLoc {
+            cell_offset: REG_HEAD_OFFSET + child_rel as usize,
+            cell_size: child_size,
+            parent_offset: parent_rel,
+            subkeys_offset: MAX_OFFSET,
+            values_offset: MAX_OFFSET,
+            security_offset: security_rel,
+            class_offset: MAX_OFFSET,
+            flags: if child_name.chars().all(|c| (c as u32) <= 0xFF) {
+                0x0020
+            } else {
+                0
+            },
+        };
+
+        let new_child = RegKey {
+            name: child_name.to_string(),
+            last_written: allocator::current_filetime(),
+            subkeys_count: 0,
+            values_count: 0,
+            subkeys: Vec::new(),
+            values: Vec::new(),
+            class_name: None,
+            location: Some(child_loc),
+        };
+
+        let parent_mut = self.find_key_mut(parent_path).unwrap();
+        parent_mut.subkeys_count += 1;
+        if let Some(loc) = parent_mut.location.as_mut() {
+            loc.subkeys_offset = new_subkeys_off;
+        }
+        parent_mut.subkeys.push(new_child);
+        parent_mut.subkeys.sort_by_key(|a| a.name.to_lowercase());
+
+        Ok(())
+    }
+
+    pub fn create_key(&mut self, key_path: &str) -> io::Result<()> {
+        let parts: Vec<&str> = key_path.split('\\').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return Ok(());
+        }
+
+        let mut current_path = String::new();
+        for part in parts {
+            let next_path = if current_path.is_empty() {
+                part.to_string()
+            } else {
+                format!("{}\\{}", current_path, part)
+            };
+
+            if self.find_key(&next_path).is_none() {
+                self.create_child_key(&current_path, part)?;
+            }
+            current_path = next_path;
+        }
+
+        Ok(())
+    }
+
+    pub fn set_value(
+        &mut self,
+        key_path: &str,
+        value_name: &str,
+        value_type: RegValueType,
+        data: &[u8],
+    ) -> io::Result<()> {
+        if self.find_key(key_path).is_none() {
+            self.create_key(key_path)?;
+        }
+
+        let existing = self
+            .find_key(key_path)
+            .and_then(|k| {
+                k.values
+                    .iter()
+                    .find(|v| v.name.eq_ignore_ascii_case(value_name))
+            })
+            .cloned();
+
+        if let Some(val) = existing {
+            self.set_raw_value_data(key_path, value_name, data, None)?;
+
+            if val.value_type != value_type {
+                if let Some(loc) = val.location {
+                    let vk_abs = loc.cell_offset;
+                    if vk_abs + 4 + 0x10 <= self.raw_data.len() {
+                        self.raw_data[vk_abs + 4 + 0x0C..vk_abs + 4 + 0x10]
+                            .copy_from_slice(&value_type.to_u32().to_le_bytes());
+                    }
+                }
+                let k_mut = self.find_key_mut(key_path).unwrap();
+                if let Some(v_mut) = k_mut
+                    .values
+                    .iter_mut()
+                    .find(|v| v.name.eq_ignore_ascii_case(value_name))
+                {
+                    v_mut.value_type = value_type;
+                }
+            }
+            return Ok(());
+        }
+
+        let parent_loc = self
+            .find_key(key_path)
+            .and_then(|k| k.location.clone())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Key location not tracked")
+            })?;
+
+        let parent_rel = (parent_loc.cell_offset - REG_HEAD_OFFSET) as u32;
+
+        let (vk_rel, _vk_sz) = allocator::create_value_node(
+            &mut self.raw_data,
+            &mut self.base_block,
+            value_name,
+            value_type.to_u32(),
+            data,
+        )?;
+
+        let new_list_off = match allocator::add_value_to_parent(
+            &mut self.raw_data,
+            &mut self.base_block,
+            parent_rel,
+            vk_rel,
+            value_name.chars().count(),
+            data.len(),
+        ) {
+            Ok(off) => off,
+            Err(e) => {
+                allocator::free_cell(
+                    &mut self.raw_data,
+                    vk_rel,
+                    self.base_block.hive_bins_data_size,
+                );
+                return Err(e);
+            }
+        };
+
+        let vk_abs = REG_HEAD_OFFSET + vk_rel as usize;
+        let is_inline = data.len() <= 4;
+        let data_offset = if is_inline {
+            vk_abs + 4 + 8
+        } else {
+            let d_off = u32::from_le_bytes(
+                self.raw_data[vk_abs + 12..vk_abs + 16]
+                    .try_into()
+                    .unwrap_or_default(),
+            );
+            REG_HEAD_OFFSET + d_off as usize
+        };
+
+        let new_val = RegValue {
+            name: if value_name.is_empty() {
+                "(Default)".to_string()
+            } else {
+                value_name.to_string()
+            },
+            value_type,
+            data: data.to_vec(),
+            location: Some(RegValueLoc {
+                cell_offset: vk_abs,
+                data_offset,
+                data_size: data.len() as u32,
+                inline: is_inline,
+            }),
+        };
+
+        let k_mut = self.find_key_mut(key_path).unwrap();
+        k_mut.values_count += 1;
+        if let Some(loc) = k_mut.location.as_mut() {
+            loc.values_offset = new_list_off;
+        }
+        k_mut.values.push(new_val);
+
+        Ok(())
+    }
+
+    pub fn set_string(&mut self, key_path: &str, value_name: &str, value: &str) -> io::Result<()> {
+        let mut data: Vec<u8> = value.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        data.extend_from_slice(&[0, 0]);
+        self.set_value(key_path, value_name, RegValueType::String, &data)
+    }
+
+    pub fn set_dword(&mut self, key_path: &str, value_name: &str, value: u32) -> io::Result<()> {
+        self.set_value(
+            key_path,
+            value_name,
+            RegValueType::Dword,
+            &value.to_le_bytes(),
+        )
+    }
+
+    pub fn set_qword(&mut self, key_path: &str, value_name: &str, value: u64) -> io::Result<()> {
+        self.set_value(
+            key_path,
+            value_name,
+            RegValueType::Qword,
+            &value.to_le_bytes(),
+        )
+    }
+
+    pub fn set_binary(&mut self, key_path: &str, value_name: &str, value: &[u8]) -> io::Result<()> {
+        self.set_value(key_path, value_name, RegValueType::Binary, value)
+    }
+
+    pub fn set_multi_string<S: AsRef<str>>(
+        &mut self,
+        key_path: &str,
+        value_name: &str,
+        values: &[S],
+    ) -> io::Result<()> {
+        let mut data = Vec::new();
+        for s in values {
+            for c in s.as_ref().encode_utf16() {
+                data.extend_from_slice(&c.to_le_bytes());
+            }
+            data.extend_from_slice(&[0, 0]);
+        }
+        data.extend_from_slice(&[0, 0]);
+        self.set_value(key_path, value_name, RegValueType::MultiString, &data)
+    }
+
+    fn set_raw_value_data(
+        &mut self,
+        key_path: &str,
+        value_name: &str,
+        new_data: &[u8],
+        expected_type: Option<RegValueType>,
+    ) -> io::Result<()> {
+        let location = {
+            let key = self
+                .find_key(key_path)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Key not found"))?;
+
+            let value = key
+                .values
+                .iter()
+                .find(|v| v.name.eq_ignore_ascii_case(value_name))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Value not found"))?;
+
+            if let Some(ref exp) = expected_type
+                && &value.value_type != exp
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Value is not {:?} type", exp),
+                ));
             }
 
-            // hbin blocks are usually aligned to 4096 bytes.
-            // We must jump from one to another based on their actual size.
-            if &self.raw_data[current_offset..current_offset + 4] == b"hbin" {
-                let hbin_size = u32::from_le_bytes(
-                    self.raw_data[current_offset + 8..current_offset + 12]
-                        .try_into()
-                        .unwrap(),
-                );
-                let mut offset_hbin = 24;
+            value.location.clone().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Value location not tracked")
+            })?
+        };
 
-                while offset_hbin < hbin_size {
-                    let cell_offset = current_offset + offset_hbin as usize;
-                    if cell_offset + 4 > self.raw_data.len() {
-                        break;
+        let vk_cell = location.cell_offset + 4;
+        let final_location: RegValueLoc;
+
+        if location.inline {
+            if new_data.len() <= 4 {
+                let mut inline_buf = [0u8; 4];
+                inline_buf[..new_data.len()].copy_from_slice(new_data);
+                self.raw_data[vk_cell + 8..vk_cell + 12].copy_from_slice(&inline_buf);
+
+                let new_size = (new_data.len() as u32) | INLINE_DATA_FLAG;
+                self.raw_data[vk_cell + 4..vk_cell + 8].copy_from_slice(&new_size.to_le_bytes());
+
+                final_location = RegValueLoc {
+                    cell_offset: location.cell_offset,
+                    data_offset: location.cell_offset + 4 + 8,
+                    data_size: new_data.len() as u32,
+                    inline: true,
+                };
+            } else {
+                let (new_vk_size, new_vk_offset, is_inline) = allocator::allocate_value_data(
+                    &mut self.raw_data,
+                    &mut self.base_block,
+                    new_data,
+                )?;
+
+                self.raw_data[vk_cell + 4..vk_cell + 8].copy_from_slice(&new_vk_size.to_le_bytes());
+                self.raw_data[vk_cell + 8..vk_cell + 12]
+                    .copy_from_slice(&new_vk_offset.to_le_bytes());
+
+                final_location = RegValueLoc {
+                    cell_offset: location.cell_offset,
+                    data_offset: if is_inline {
+                        location.cell_offset + 4 + 8
+                    } else {
+                        REG_HEAD_OFFSET + new_vk_offset as usize
+                    },
+                    data_size: new_data.len() as u32,
+                    inline: is_inline,
+                };
+            }
+        } else {
+            if new_data.len() <= 4 {
+                allocator::free_value_data(
+                    &mut self.raw_data,
+                    self.base_block.hive_bins_data_size,
+                    false,
+                    location.data_offset,
+                );
+
+                let mut inline_buf = [0u8; 4];
+                inline_buf[..new_data.len()].copy_from_slice(new_data);
+                self.raw_data[vk_cell + 8..vk_cell + 12].copy_from_slice(&inline_buf);
+
+                let new_size = (new_data.len() as u32) | INLINE_DATA_FLAG;
+                self.raw_data[vk_cell + 4..vk_cell + 8].copy_from_slice(&new_size.to_le_bytes());
+
+                final_location = RegValueLoc {
+                    cell_offset: location.cell_offset,
+                    data_offset: location.cell_offset + 4 + 8,
+                    data_size: new_data.len() as u32,
+                    inline: true,
+                };
+            } else {
+                let old_cell_abs = location.data_offset;
+                let old_raw_size = if old_cell_abs + 4 <= self.raw_data.len() {
+                    i32::from_le_bytes(
+                        self.raw_data[old_cell_abs..old_cell_abs + 4]
+                            .try_into()
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    0
+                };
+
+                let is_db = if old_cell_abs + 6 <= self.raw_data.len() {
+                    &self.raw_data[old_cell_abs + 4..old_cell_abs + 6] == SIGNATURE_BIG_DATA
+                } else {
+                    false
+                };
+
+                let old_cap = allocator::cell_capacity(old_raw_size);
+
+                if !is_db && new_data.len() <= BIG_DATA_THRESHOLD && new_data.len() <= old_cap {
+                    let data_start = old_cell_abs + 4;
+                    self.raw_data[data_start..data_start + new_data.len()]
+                        .copy_from_slice(new_data);
+                    if data_start + old_cap <= self.raw_data.len() {
+                        self.raw_data[data_start + new_data.len()..data_start + old_cap].fill(0);
                     }
 
-                    let cell_size = i32::from_le_bytes(
-                        self.raw_data[cell_offset..cell_offset + 4]
-                            .try_into()
-                            .unwrap(),
+                    self.raw_data[vk_cell + 4..vk_cell + 8]
+                        .copy_from_slice(&(new_data.len() as u32).to_le_bytes());
+
+                    final_location = RegValueLoc {
+                        cell_offset: location.cell_offset,
+                        data_offset: location.data_offset,
+                        data_size: new_data.len() as u32,
+                        inline: false,
+                    };
+                } else {
+                    let (new_vk_size, new_vk_offset, is_inline) = allocator::allocate_value_data(
+                        &mut self.raw_data,
+                        &mut self.base_block,
+                        new_data,
+                    )?;
+
+                    allocator::free_value_data(
+                        &mut self.raw_data,
+                        self.base_block.hive_bins_data_size,
+                        false,
+                        location.data_offset,
                     );
 
-                    if cell_size.unsigned_abs() < 4 {
-                        break;
-                    } else if cell_size > 0 && cell_size as usize >= aligned_size {
-                        return Some((cell_offset - REG_HEAD_OFFSET) as u32);
-                    }
+                    self.raw_data[vk_cell + 4..vk_cell + 8]
+                        .copy_from_slice(&new_vk_size.to_le_bytes());
+                    self.raw_data[vk_cell + 8..vk_cell + 12]
+                        .copy_from_slice(&new_vk_offset.to_le_bytes());
 
-                    offset_hbin += cell_size.unsigned_abs();
+                    final_location = RegValueLoc {
+                        cell_offset: location.cell_offset,
+                        data_offset: if is_inline {
+                            location.cell_offset + 4 + 8
+                        } else {
+                            REG_HEAD_OFFSET + new_vk_offset as usize
+                        },
+                        data_size: new_data.len() as u32,
+                        inline: is_inline,
+                    };
                 }
-                current_offset += hbin_size as usize;
-            } else {
-                current_offset += 4096;
             }
         }
 
-        None
-    }
+        let key_mut = self
+            .find_key_mut(key_path)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Key became invalid"))?;
+        let value_mut = key_mut
+            .values
+            .iter_mut()
+            .find(|v| v.name.eq_ignore_ascii_case(value_name))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Value became invalid"))?;
 
-    fn expand_hive(&mut self, size_needed: usize) -> io::Result<u32> {
-        let current_size = self.raw_data.len();
-
-        // hbin-block size must be multiple with REG_HEAD_OFFSET value
-        if !current_size.is_multiple_of(REG_HEAD_OFFSET) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Hive size is not aligned to 4096 bytes",
-            ));
-        }
-
-        let hbin_offset = current_size;
-        let new_size = current_size + REG_HEAD_OFFSET;
-        self.raw_data.resize(new_size, 0);
-
-        self.raw_data[hbin_offset..hbin_offset + 4].copy_from_slice(b"hbin");
-        self.raw_data[hbin_offset + 4..hbin_offset + 8]
-            .copy_from_slice(&(hbin_offset as u32 - REG_HEAD_OFFSET as u32).to_le_bytes());
-        self.raw_data[hbin_offset + 8..hbin_offset + 12]
-            .copy_from_slice(&(REG_HEAD_OFFSET as u32).to_le_bytes());
-
-        let cell_offset = hbin_offset + 24;
-        let cell_size = REG_HEAD_OFFSET - 24;
-
-        self.raw_data[cell_offset..cell_offset + 4]
-            .copy_from_slice(&(cell_size as i32).to_le_bytes());
-
-        self.base_block.hive_bins_data_size = new_size as u32 - REG_HEAD_OFFSET as u32;
-        self.raw_data[12..16].copy_from_slice(&self.base_block.hive_bins_data_size.to_le_bytes());
-
-        if cell_size < size_needed + 4 {
-            return Err(io::Error::other(
-                "Failed to allocate enough space even after expansion",
-            ));
-        }
-
-        Ok((cell_offset - REG_HEAD_OFFSET) as u32)
-    }
-
-    fn write_to_cell(&mut self, offset: u32, data: &[u8]) -> io::Result<()> {
-        let cell_absolute_offset = REG_HEAD_OFFSET + offset as usize;
-        let cell_size_with_header = data.len() + 4;
-        let aligned_size = (cell_size_with_header + 7) & !7;
-
-        self.raw_data[cell_absolute_offset..cell_absolute_offset + 4]
-            .copy_from_slice(&(-(aligned_size as i32)).to_le_bytes());
-
-        let data_start = cell_absolute_offset + 4;
-        self.raw_data[data_start..data_start + data.len()].copy_from_slice(data);
+        value_mut.data = new_data.to_vec();
+        value_mut.location = Some(final_location);
 
         Ok(())
     }
@@ -526,85 +969,12 @@ impl RegHive {
         value: &str,
         new_value: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let location = {
-            let key = self
-                .find_key(key_path)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Key not found"))?;
-
-            let value = key
-                .values
-                .iter()
-                .find(|v| v.name.eq_ignore_ascii_case(value))
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Value not found"))?;
-
-            if !matches!(value.value_type, RegValueType::Dword) {
-                return Err(
-                    io::Error::new(io::ErrorKind::InvalidInput, "Value is not DWORD type").into(),
-                );
-            }
-
-            value.location.clone().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "Value location not tracked")
-            })?
-        };
-
-        let new_bytes = new_value.to_le_bytes();
-
-        if location.inline {
-            let data_slice = self
-                .raw_data
-                .get_mut(location.data_offset..location.data_offset + 4)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Inline data offset out of bounds",
-                    )
-                })?;
-            data_slice.copy_from_slice(&new_bytes);
-        } else {
-            let data_start = location.data_offset + 4;
-            let data_slice = self
-                .raw_data
-                .get_mut(data_start..data_start + 4)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Data cell offset out of bounds")
-                })?;
-            data_slice.copy_from_slice(&new_bytes);
-        }
-
-        let value_mut: &mut RegValue = self
-            .find_key_mut(key_path)
-            .and_then(|key| {
-                key.values
-                    .iter_mut()
-                    .find(|v| v.name.eq_ignore_ascii_case(value))
-            })
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "Value became invalid after checks")
-            })?;
-
-        value_mut.data = new_bytes.to_vec();
-        // let parts: Vec<&str> = key_path.split('\\').filter(|s| !s.is_empty()).collect();
-        // let mut current_key = self.root_key.as_mut().ok_or("Root key is missing")?;
-        //
-        // for part in parts {
-        //     current_key = current_key
-        //         .subkeys
-        //         .iter_mut()
-        //         .find(|sk| sk.name.eq_ignore_ascii_case(part))
-        //         .ok_or_else(|| {
-        //             io::Error::new(io::ErrorKind::NotFound, "Key path became invalid")
-        //         })?;
-        // }
-        //
-        // let value_mut = current_key
-        //     .values
-        //     .iter_mut()
-        //     .find(|v| v.name.eq_ignore_ascii_case(value))
-        //     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Value became invalid"))?;
-        //
-        // value_mut.data = new_bytes.to_vec();
-
+        self.set_raw_value_data(
+            key_path,
+            value,
+            &new_value.to_le_bytes(),
+            Some(RegValueType::Dword),
+        )?;
         Ok(())
     }
 
@@ -614,63 +984,12 @@ impl RegHive {
         value_name: &str,
         new_value: u64,
     ) -> io::Result<()> {
-        let location = {
-            let key = self
-                .find_key(key_path)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Key not found"))?;
-
-            let value: &RegValue = key
-                .values
-                .iter()
-                .find(|v| v.name.eq_ignore_ascii_case(value_name))
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Value not found"))?;
-
-            if !matches!(value.value_type, RegValueType::Qword) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Value is not QWORD type",
-                ));
-            }
-
-            let location = value.location.clone().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "Value location not tracked")
-            })?;
-
-            if location.data_size < 8 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "QWORD data size mismatch",
-                ));
-            }
-            if location.inline {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "QWORD cannot be inline",
-                ));
-            }
-
-            location
-        };
-
-        let new_bytes = new_value.to_le_bytes();
-
-        let data_start = location.data_offset + 4;
-        self.raw_data[data_start..data_start + 8].copy_from_slice(&new_bytes);
-
-        let value_mut = self
-            .find_key_mut(key_path)
-            .and_then(|key| {
-                key.values
-                    .iter_mut()
-                    .find(|v| v.name.eq_ignore_ascii_case(value_name))
-            })
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "Value became invalid after checks")
-            })?;
-
-        value_mut.data = new_bytes.to_vec();
-
-        Ok(())
+        self.set_raw_value_data(
+            key_path,
+            value_name,
+            &new_value.to_le_bytes(),
+            Some(RegValueType::Qword),
+        )
     }
 
     pub fn update_string_value(
@@ -679,100 +998,13 @@ impl RegHive {
         value_name: &str,
         new_value: &str,
     ) -> io::Result<()> {
-        let (location, new_utf16_data, available_size) = {
-            let key = self
-                .find_key(key_path)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Key not found"))?;
-            let value = key
-                .values
-                .iter()
-                .find(|v| v.name.eq_ignore_ascii_case(value_name))
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Value not found"))?;
+        let mut utf16 = new_value
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect::<Vec<u8>>();
+        utf16.extend_from_slice(&[0, 0]);
 
-            if !matches!(
-                value.value_type,
-                RegValueType::String | RegValueType::ExpandString
-            ) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Value is not string type",
-                ));
-            }
-
-            let location = value.location.clone().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "Value location not tracked")
-            })?;
-
-            let available_size = if location.inline {
-                4
-            } else {
-                location.data_size as usize
-            };
-
-            let mut utf16 = new_value
-                .encode_utf16()
-                .flat_map(|c| c.to_le_bytes())
-                .collect::<Vec<u8>>();
-            utf16.extend_from_slice(&[0, 0]); // null terminator
-
-            (location, utf16, available_size)
-        };
-
-        let (final_data, final_location) = if new_utf16_data.len() <= available_size {
-            // ===
-            // free space method
-            // ===
-            let mut data_to_write = new_utf16_data;
-            data_to_write.resize(available_size, 0);
-
-            if location.inline {
-                let vk_data_offset_pos = location.cell_offset + 4 + 0x08;
-                self.raw_data[vk_data_offset_pos..vk_data_offset_pos + 4]
-                    .copy_from_slice(&data_to_write[..4]);
-            } else {
-                let data_start = location.data_offset + 4;
-                self.raw_data[data_start..data_start + data_to_write.len()]
-                    .copy_from_slice(&data_to_write);
-            }
-
-            (data_to_write, location)
-        } else {
-            // ===
-            // expanding have
-            // ===
-            let final_offset = match self.find_space(new_utf16_data.len()) {
-                Some(offset) => offset,
-                None => self.expand_hive(new_utf16_data.len())?,
-            };
-
-            self.write_to_cell(final_offset, &new_utf16_data)?;
-
-            let vk_cell = location.cell_offset + 4;
-            let new_size = new_utf16_data.len() as u32;
-            self.raw_data[vk_cell + 4..vk_cell + 8].copy_from_slice(&new_size.to_le_bytes());
-            self.raw_data[vk_cell + 8..vk_cell + 12].copy_from_slice(&final_offset.to_le_bytes());
-
-            let new_location = RegValueLoc {
-                cell_offset: location.cell_offset,
-                inline: false,
-                data_offset: REG_HEAD_OFFSET + final_offset as usize,
-                data_size: new_size,
-            };
-
-            (new_utf16_data, new_location)
-        };
-
-        let key_mut = self.find_key_mut(key_path).unwrap();
-        let value_mut = key_mut
-            .values
-            .iter_mut()
-            .find(|v| v.name.eq_ignore_ascii_case(value_name))
-            .unwrap();
-
-        value_mut.data = final_data;
-        value_mut.location = Some(final_location);
-
-        Ok(())
+        self.set_raw_value_data(key_path, value_name, &utf16, None)
     }
 
     pub fn update_binary_value(
@@ -781,55 +1013,7 @@ impl RegHive {
         value_name: &str,
         new_data: &[u8],
     ) -> io::Result<()> {
-        let location: RegValueLoc;
-
-        {
-            let key = self
-                .find_key(key_path)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Key not found"))?;
-
-            let value = key
-                .values
-                .iter()
-                .find(|v| v.name.eq_ignore_ascii_case(value_name))
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Value not found"))?;
-
-            location = value.location.clone().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "Value location not tracked")
-            })?;
-
-            if new_data.len() > location.data_size as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "New data too long: {} > {}",
-                        new_data.len(),
-                        location.data_size
-                    ),
-                ));
-            }
-        }
-
-        let mut padded_data = new_data.to_vec();
-        padded_data.resize(location.data_size as usize, 0);
-
-        if location.inline {
-            self.raw_data[location.data_offset..location.data_offset + padded_data.len()]
-                .copy_from_slice(&padded_data);
-        } else {
-            let data_start = location.data_offset + 4;
-            self.raw_data[data_start..data_start + padded_data.len()].copy_from_slice(&padded_data);
-        }
-
-        let key_mut = self.find_key_mut(key_path).unwrap();
-        let value_mut = key_mut
-            .values
-            .iter_mut()
-            .find(|v| v.name.eq_ignore_ascii_case(value_name))
-            .unwrap();
-        value_mut.data = padded_data;
-
-        Ok(())
+        self.set_raw_value_data(key_path, value_name, new_data, Some(RegValueType::Binary))
     }
 
     fn rebuild_sequence(&mut self) {
@@ -839,17 +1023,21 @@ impl RegHive {
         self.raw_data[4..8].copy_from_slice(&self.base_block.sequence1.to_le_bytes());
         self.raw_data[8..12].copy_from_slice(&self.base_block.sequence2.to_le_bytes());
 
-        // checksum
+        self.raw_data[40..44].copy_from_slice(&self.base_block.hive_bins_data_size.to_le_bytes());
+
         let mut checksum: u32 = 0;
-        for chunk in self.raw_data[0..508].chunks_exact(4) {
-            checksum ^= u32::from_le_bytes(chunk.try_into().unwrap());
+        for chunk in self.raw_data[0..508].as_chunks::<4>().0.iter() {
+            checksum ^= u32::from_le_bytes(*chunk);
+        }
+        if checksum == 0xFFFFFFFF {
+            checksum = 0xFFFFFFFE;
+        } else if checksum == 0 {
+            checksum = 1;
         }
         self.raw_data[508..512].copy_from_slice(&checksum.to_le_bytes());
     }
 
     pub fn commit(&mut self) -> io::Result<()> {
-        // quite simple
-        // path -> temp_file -> renaming -> done
         let path = self.path.clone().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -864,14 +1052,14 @@ impl RegHive {
         let temp_path = PathBuf::from(temp_file);
 
         {
-            let mut temp_file = OpenOptions::new()
+            let mut temp = OpenOptions::new()
                 .write(true)
                 .truncate(true)
                 .create(true)
                 .open(&temp_path)?;
 
-            temp_file.write_all(&self.raw_data)?;
-            temp_file.sync_all()?;
+            temp.write_all(&self.raw_data)?;
+            temp.sync_all()?;
         }
 
         std::fs::rename(&temp_path, &path)?;
@@ -891,5 +1079,13 @@ impl RegHive {
         self.path = Some(path.as_ref().to_path_buf());
 
         Ok(())
+    }
+
+    pub fn validate(&self) -> io::Result<()> {
+        allocator::validate_hive_structures(&self.raw_data, &self.base_block)
+    }
+
+    pub fn raw_data(&self) -> &[u8] {
+        &self.raw_data
     }
 }
